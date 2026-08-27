@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 const PORT = Number(process.env.PORT || 10000);
 const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
@@ -94,29 +95,48 @@ async function synchronize(body) {
     `kaguya:rate:${body.serverHash}:${body.clientId}`,
     now, body.clientId, body.payload, now - STALE_SECONDS
   ];
-  let upstream;
-  try {
-    upstream = await fetch(UPSTASH_URL, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${UPSTASH_TOKEN}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify(command),
-      signal: AbortSignal.timeout(25_000)
-    });
-  } catch (error) {
-    console.error(`Upstash request failed: ${error.name}: ${error.message}; cause=${error.cause?.code || "none"}`);
-    throw error;
-  }
-  const value = await upstream.json();
-  if (!upstream.ok || value.error) {
+  const upstream = await postUpstash(command);
+  const value = upstream.value;
+  if (upstream.status < 200 || upstream.status >= 300 || value.error) {
     const error = new Error(value.error || `upstash_http_${upstream.status}`);
     error.status = String(value.error || "").includes("RATE_LIMIT") ? 429
       : String(value.error || "").includes("REPLAY") ? 409 : 502;
     throw error;
   }
   return Array.isArray(value.result) ? value.result : [];
+}
+
+function postUpstash(command) {
+  return new Promise((resolve, reject) => {
+    const encoded = Buffer.from(JSON.stringify(command));
+    const request = httpsRequest(new URL(UPSTASH_URL), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${UPSTASH_TOKEN}`,
+        "content-type": "application/json",
+        "content-length": encoded.length
+      }
+    }, response => {
+      const chunks = [];
+      let size = 0;
+      response.on("data", chunk => {
+        size += chunk.length;
+        if (size > 1024 * 1024) request.destroy(new Error("upstash_response_too_large"));
+        else chunks.push(chunk);
+      });
+      response.on("end", () => {
+        try {
+          resolve({ status: response.statusCode || 500, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+        } catch (error) { reject(error); }
+      });
+    });
+    request.setTimeout(25_000, () => request.destroy(new Error("upstash_timeout")));
+    request.on("error", error => {
+      console.error(`Upstash request failed: ${error.name}: ${error.message}; cause=${error.code || "none"}`);
+      reject(error);
+    });
+    request.end(encoded);
+  });
 }
 
 const server = createServer(async (request, response) => {
