@@ -113,7 +113,7 @@ function adminAuthorized(request) {
 
 async function adminDevices() {
   const [active, pending] = await Promise.all([postUpstash(["HGETALL", "kaguya:auth:licenses"]), postUpstash(["HGETALL", "kaguya:auth:pending"])]);
-  const decode = (values, state) => { const result=[]; for(let i=0;i<(values||[]).length;i+=2){try{result.push({key:values[i],state,...JSON.parse(values[i+1])})}catch{}} return result };
+  const decode = (values, state) => { const result=[]; for(let i=0;i<(values||[]).length;i+=2){try{const record=JSON.parse(values[i+1]);result.push({key:values[i],state,...record,deviceId:record.deviceId||values[i]})}catch{}} return result };
   return [...decode(active.value.result, "active"), ...decode(pending.value.result, "pending")];
 }
 
