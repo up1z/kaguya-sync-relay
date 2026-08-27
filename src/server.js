@@ -141,17 +141,19 @@ async function github(path, binary = false) {
 
 async function latestAsset(protectedJar) {
   const releases = await github(`/repos/${UPDATE_REPOSITORY}/releases?per_page=10`);
+  let latest = null;
   for (const release of releases) {
     if (release.draft) continue;
     for (const asset of release.assets || []) {
       const name = String(asset.name || "").toLowerCase();
       if (!name.endsWith(".jar") || name.includes("sources") || name.includes("protected") !== protectedJar) continue;
       const source = /\d/.test(release.tag_name || "") ? release.tag_name : release.name || release.tag_name;
-      return { version: String(source).replace(/^kaguya[-_ ]*v?/i, "").replace(/^v/i, ""), size: asset.size,
+      const candidate = { version: String(source).replace(/^kaguya[-_ ]*v?/i, "").replace(/^v/i, ""), size: asset.size,
         sha256: String(asset.digest || "").replace(/^sha256:/, ""), assetId: asset.id };
+      if (!latest || compareVersions(candidate.version, latest.version) > 0) latest = candidate;
     }
   }
-  return null;
+  return latest;
 }
 
 function compareVersions(a, b) {
