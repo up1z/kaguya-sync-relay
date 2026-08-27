@@ -94,15 +94,21 @@ async function synchronize(body) {
     `kaguya:rate:${body.serverHash}:${body.clientId}`,
     now, body.clientId, body.payload, now - STALE_SECONDS
   ];
-  const upstream = await fetch(UPSTASH_URL, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${UPSTASH_TOKEN}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(command),
-    signal: AbortSignal.timeout(10_000)
-  });
+  let upstream;
+  try {
+    upstream = await fetch(UPSTASH_URL, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${UPSTASH_TOKEN}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(command),
+      signal: AbortSignal.timeout(25_000)
+    });
+  } catch (error) {
+    console.error(`Upstash request failed: ${error.name}: ${error.message}; cause=${error.cause?.code || "none"}`);
+    throw error;
+  }
   const value = await upstream.json();
   if (!upstream.ok || value.error) {
     const error = new Error(value.error || `upstash_http_${upstream.status}`);
@@ -134,4 +140,6 @@ const server = createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Kaguya sync relay listening on ${PORT}`);
+  const host = UPSTASH_URL ? new URL(UPSTASH_URL).hostname : "missing";
+  console.log(`Upstash configuration: host=${host}, tokenLength=${UPSTASH_TOKEN.length}, keyLength=${SYNC_KEY.length}`);
 });
