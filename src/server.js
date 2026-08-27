@@ -9,6 +9,8 @@ const SYNC_KEY = process.env.SYNC_HMAC_KEY || "";
 const LICENSES = parseLicenses(process.env.KAGUYA_LICENSES_JSON || "{}");
 const GITHUB_TOKEN = process.env.KAGUYA_GITHUB_TOKEN || "";
 const UPDATE_REPOSITORY = process.env.KAGUYA_UPDATE_REPOSITORY || "up1z/Kaguya-Mod";
+const DEVICE_PEPPER = process.env.KAGUYA_DEVICE_PEPPER || "";
+const ADMIN_TOKEN = process.env.KAGUYA_ADMIN_TOKEN || "";
 const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
@@ -77,12 +79,42 @@ function parseLicenses(value) {
   catch { return {}; }
 }
 
-function authorized(body) {
-  if (!body || !/^[0-9a-f]{64}$/.test(body.hwid || "") || typeof body.license !== "string") return false;
+function deviceIdentity(body) {
+  if (!body || !/^[0-9a-f]{64}$/.test(body.hwid || "") || typeof body.license !== "string" || body.license.length < 32) return null;
   const licenseHash = createHash("sha256").update(body.license).digest("hex");
-  const expected = LICENSES[licenseHash];
-  return typeof expected === "string" && /^[0-9a-f]{64}$/.test(expected)
-    && timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(body.hwid, "hex"));
+  return { licenseHash, deviceId: createHmac("sha256", DEVICE_PEPPER).update(body.hwid).digest("hex") };
+}
+
+async function authorizeDevice(body, createPending = false) {
+  if (DEVICE_PEPPER.length < 32) throw Object.assign(new Error("device_auth_not_configured"), { status: 503 });
+  const identity = deviceIdentity(body);
+  if (!identity) return { authorized: false, deviceId: "invalid" };
+  const active = await postUpstash(["HGET", "kaguya:auth:licenses", identity.licenseHash]);
+  if (active.status >= 200 && active.status < 300 && typeof active.value.result === "string") {
+    try { if (JSON.parse(active.value.result).deviceId === identity.deviceId) return { authorized: true, deviceId: identity.deviceId }; }
+    catch { /* deny invalid records */ }
+  }
+  if (LICENSES[identity.licenseHash] === body.hwid) return { authorized: true, deviceId: identity.deviceId };
+  if (createPending) {
+    const count = await postUpstash(["HLEN", "kaguya:auth:pending"]);
+    if (Number(count.value.result || 0) >= 512) throw Object.assign(new Error("pending_queue_full"), { status: 429 });
+    await postUpstash(["HSET", "kaguya:auth:pending", identity.deviceId, JSON.stringify({ licenseHash: identity.licenseHash, requestedAt: Date.now() })]);
+    await postUpstash(["EXPIRE", "kaguya:auth:pending", 604800]);
+  }
+  return { authorized: false, deviceId: identity.deviceId };
+}
+
+function adminAuthorized(request) {
+  if (ADMIN_TOKEN.length < 32) return false;
+  const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const a = Buffer.from(supplied), b = Buffer.from(ADMIN_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function adminDevices() {
+  const [active, pending] = await Promise.all([postUpstash(["HGETALL", "kaguya:auth:licenses"]), postUpstash(["HGETALL", "kaguya:auth:pending"])]);
+  const decode = (values, state) => { const result=[]; for(let i=0;i<(values||[]).length;i+=2){try{result.push({key:values[i],state,...JSON.parse(values[i+1])})}catch{}} return result };
+  return [...decode(active.value.result, "active"), ...decode(pending.value.result, "pending")];
 }
 
 async function github(path, binary = false) {
@@ -214,20 +246,55 @@ function postUpstash(command) {
   });
 }
 
+const ADMIN_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Kaguya Device Admin</title><style>body{font:14px system-ui;background:#101018;color:#eee;max-width:980px;margin:40px auto;padding:0 16px}button{background:#24243a;color:#fff;border:1px solid #666;padding:8px}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{padding:9px;border-bottom:1px solid #333;text-align:left}.pending{color:#ffd166}.active{color:#71e29b}</style><h1>Kaguya Device Admin</h1><p>Only anonymous device IDs and license hashes are shown.</p><button id="reload">Reload</button><table><thead><tr><th>Status</th><th>Label</th><th>Anonymous device</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table><script>let token=sessionStorage.kaguyaAdmin||prompt('Admin token')||'';sessionStorage.kaguyaAdmin=token;const call=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error((await r.json()).error||r.status);return r.json()};async function load(){const data=await call('/v1/admin/devices');const rows=document.querySelector('#rows');rows.replaceChildren();for(const d of data.devices){const tr=document.createElement('tr');for(const value of [d.state,d.label||'',d.deviceId.slice(0,16)+'…']){const td=document.createElement('td');td.textContent=value;td.className=d.state;tr.append(td)}const td=document.createElement('td'),b=document.createElement('button');b.textContent=d.state==='pending'?'Approve':'Revoke';b.onclick=async()=>{if(d.state==='pending')await call('/v1/admin/approve',{deviceId:d.deviceId,label:prompt('Device label','Kaguya device')||''});else if(confirm('Revoke '+(d.label||d.deviceId.slice(0,16))+'?'))await call('/v1/admin/revoke',{licenseHash:d.key});await load()};td.append(b);tr.append(td);rows.append(tr)} }document.querySelector('#reload').onclick=load;load().catch(e=>alert(e.message));</script>`;
+
 const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     return json(response, validEnvironment() ? 200 : 503, { ok: validEnvironment() });
   }
+  if (request.method === "GET" && request.url === "/admin") {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'", "cache-control": "no-store" });
+    return response.end(ADMIN_HTML);
+  }
   if (request.method === "POST" && request.url === "/v1/auth") {
     try {
+      const source = String(request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown").split(",")[0].trim();
+      const sourceId = createHmac("sha256", DEVICE_PEPPER).update(source).digest("hex").slice(0,24);
+      const rate = await postUpstash(["INCR", `kaguya:auth:rate:${sourceId}`]);
+      if (Number(rate.value.result || 0) === 1) await postUpstash(["EXPIRE", `kaguya:auth:rate:${sourceId}`, 3600]);
+      if (Number(rate.value.result || 0) > 20) return json(response, 429, { authorized:false, error:"rate_limited" });
       const body = await readBody(request);
-      return json(response, authorized(body) ? 200 : 403, { authorized: authorized(body) });
-    } catch { return json(response, 400, { authorized: false }); }
+      const result = await authorizeDevice(body, true);
+      return json(response, result.authorized ? 200 : 202, result);
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { authorized: false, error: error.message }); }
+  }
+  if (request.url?.startsWith("/v1/admin/")) {
+    if (!adminAuthorized(request)) return json(response, 401, { error: "admin_unauthorized" });
+    try {
+      if (request.method === "GET" && request.url === "/v1/admin/devices") return json(response, 200, { devices: await adminDevices() });
+      const body = await readBody(request);
+      if (request.method === "POST" && request.url === "/v1/admin/approve") {
+        if (!/^[0-9a-f]{64}$/.test(body.deviceId || "")) return json(response, 400, { error: "invalid_device" });
+        const pending = await postUpstash(["HGET", "kaguya:auth:pending", body.deviceId]);
+        if (typeof pending.value.result !== "string") return json(response, 404, { error: "pending_device_not_found" });
+        const record = JSON.parse(pending.value.result);
+        await postUpstash(["HSET", "kaguya:auth:licenses", record.licenseHash, JSON.stringify({ deviceId: body.deviceId, label: String(body.label || "").slice(0,80), approvedAt: Date.now() })]);
+        await postUpstash(["HDEL", "kaguya:auth:pending", body.deviceId]);
+        return json(response, 200, { ok: true });
+      }
+      if (request.method === "POST" && request.url === "/v1/admin/revoke") {
+        if (!/^[0-9a-f]{64}$/.test(body.licenseHash || "")) return json(response, 400, { error: "invalid_license" });
+        await postUpstash(["HDEL", "kaguya:auth:licenses", body.licenseHash]);
+        return json(response, 200, { ok: true });
+      }
+      return json(response, 404, { error: "not_found" });
+    } catch (error) { return json(response, 500, { error: error.message || "admin_failed" }); }
   }
   if (request.method === "POST" && (request.url === "/v1/update/check" || request.url === "/v1/update/download")) {
     try {
       const body = await readBody(request);
-      if (!authorized(body)) return json(response, 403, { error: "device_not_authorized" });
+      const authorization = await authorizeDevice(body, false);
+      if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized", deviceId: authorization.deviceId });
       const asset = await latestAsset(Boolean(body.protected));
       if (!asset) return json(response, 404, { error: "update_asset_not_found" });
       if (request.url === "/v1/update/check") return json(response, 200, {
