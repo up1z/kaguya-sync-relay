@@ -9,6 +9,7 @@ const SYNC_KEY = process.env.SYNC_HMAC_KEY || "";
 const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
+const MAX_CLIENTS_PER_SERVER = 64;
 
 // One EVAL invocation performs replay protection, rate limiting, state update,
 // stale-client pruning, and retrieval. Upstash bills this as one command.
@@ -17,6 +18,7 @@ local now = tonumber(ARGV[1])
 local client = ARGV[2]
 local payload = ARGV[3]
 local cutoff = tonumber(ARGV[4])
+local maximum = tonumber(ARGV[5])
 
 if not redis.call('SET', KEYS[2], '1', 'EX', 300, 'NX') then
   return redis.error_reply('REPLAY')
@@ -27,7 +29,9 @@ if rate == 1 then redis.call('EXPIRE', KEYS[3], 60) end
 if rate > 10 then return redis.error_reply('RATE_LIMIT') end
 
 redis.call('HSET', KEYS[1], client, tostring(now) .. '|' .. payload)
+redis.call('EXPIRE', KEYS[1], 604800)
 local entries = redis.call('HGETALL', KEYS[1])
+local active = {}
 local result = {}
 for index = 1, #entries, 2 do
   local field = entries[index]
@@ -37,7 +41,15 @@ for index = 1, #entries, 2 do
   if updated < cutoff then
     redis.call('HDEL', KEYS[1], field)
   elseif separator then
-    table.insert(result, string.sub(value, separator + 1))
+    table.insert(active, { field, updated, string.sub(value, separator + 1) })
+  end
+end
+table.sort(active, function(a, b) return a[2] > b[2] end)
+for index, entry in ipairs(active) do
+  if index <= maximum then
+    table.insert(result, entry[3])
+  else
+    redis.call('HDEL', KEYS[1], entry[1])
   end
 end
 return result
@@ -93,7 +105,7 @@ async function synchronize(body) {
     `kaguya:state:${body.serverHash}`,
     `kaguya:nonce:${body.serverHash}:${body.nonce}`,
     `kaguya:rate:${body.serverHash}:${body.clientId}`,
-    now, body.clientId, body.payload, now - STALE_SECONDS
+    now, body.clientId, body.payload, now - STALE_SECONDS, MAX_CLIENTS_PER_SERVER
   ];
   const upstream = await postUpstash(command);
   const value = upstream.value;
