@@ -297,9 +297,18 @@ const server = createServer(async (request, response) => {
       if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized", deviceId: authorization.deviceId });
       const asset = await latestAsset(Boolean(body.protected));
       if (!asset) return json(response, 404, { error: "update_asset_not_found" });
-      if (request.url === "/v1/update/check") return json(response, 200, {
-        update: compareVersions(asset.version, body.version) > 0, version: asset.version, size: asset.size, sha256: asset.sha256
-      });
+      if (request.url === "/v1/update/check") {
+        const versionDifference = compareVersions(asset.version, body.version);
+        const currentSha256 = String(body.currentSha256 || "").toLowerCase();
+        const sameVersionReplacement = versionDifference === 0
+          && /^[0-9a-f]{64}$/.test(asset.sha256)
+          && /^[0-9a-f]{64}$/.test(currentSha256)
+          && asset.sha256 !== currentSha256;
+        return json(response, 200, {
+          update: versionDifference > 0 || sameVersionReplacement,
+          version: asset.version, size: asset.size, sha256: asset.sha256
+        });
+      }
       const jar = await github(`/repos/${UPDATE_REPOSITORY}/releases/assets/${asset.assetId}`, true);
       response.writeHead(200, { "content-type": "application/java-archive", "content-length": jar.length, "cache-control": "private, no-store" });
       return response.end(jar);
