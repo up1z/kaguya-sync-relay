@@ -123,12 +123,17 @@ const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     return json(response, validEnvironment() ? 200 : 503, { ok: validEnvironment() });
   }
-  if (request.method !== "POST" || request.url !== "/v1/sync") {
+  const requestUrl = new URL(request.url, "http://relay.local");
+  const tunneled = request.method === "GET" && requestUrl.pathname === "/v1/sync";
+  const posted = request.method === "POST" && requestUrl.pathname === "/v1/sync";
+  if (!tunneled && !posted) {
     return json(response, 404, { error: "not_found" });
   }
   if (!validEnvironment()) return json(response, 503, { error: "service_not_configured" });
   try {
-    const body = await readBody(request);
+    const body = tunneled
+      ? JSON.parse(Buffer.from(requestUrl.searchParams.get("q") || "", "base64url").toString("utf8"))
+      : await readBody(request);
     if (!verify(body)) return json(response, 401, { error: "invalid_signature_or_request" });
     const states = await synchronize(body);
     return json(response, 200, { states, serverTime: Date.now() });
