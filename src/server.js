@@ -298,7 +298,12 @@ const server = createServer(async (request, response) => {
       const authorization = await authorizeDevice(body, false);
       if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized", deviceId: authorization.deviceId });
       const asset = await latestAsset(Boolean(body.protected));
-      if (!asset) return json(response, 404, { error: "update_asset_not_found" });
+      if (!asset) {
+        if (request.url === "/v1/update/check") {
+          return json(response, 200, { update: false, reason: "update_asset_not_found" });
+        }
+        return json(response, 404, { error: "update_asset_not_found" });
+      }
       if (request.url === "/v1/update/check") {
         const versionDifference = compareVersions(asset.version, body.version);
         const currentSha256 = String(body.currentSha256 || "").toLowerCase();
