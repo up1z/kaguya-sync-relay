@@ -18,7 +18,13 @@ const OCI_USER = process.env.OCI_USER_OCID || "";
 const OCI_FINGERPRINT = process.env.OCI_FINGERPRINT || "";
 const OCI_PRIVATE_KEY = (process.env.OCI_PRIVATE_KEY_PEM || "").replace(/\\n/g, "\n");
 const OCI_REGION = process.env.OCI_REGION || "us-ashburn-1";
-const VM_POOL = parseVmPool(process.env.KAGUYA_ORACLE_VM_POOL_JSON || "[]");
+const CONFIGURED_VM_POOL = parseVmPool(process.env.KAGUYA_ORACLE_VM_POOL_JSON || "[]");
+// Always Free can run as one permanently available proxy while OCI API keys are
+// not configured. Explicit pool configuration replaces this fallback.
+const VM_POOL = CONFIGURED_VM_POOL.length ? CONFIGURED_VM_POOL : [{
+  id: "", workerId: "worker-1", name: "Kaguya Always Free", address:
+    process.env.KAGUYA_ORACLE_STATIC_ADDRESS || "193.122.248.232:25568"
+}];
 const SESSION_IDLE_MS = 15 * 60 * 1000;
 const PROXY_LEASE_SECONDS = 150;
 const PROXY_OBSERVATION_TTL_SECONDS = 180;
@@ -57,6 +63,9 @@ async function discordFailure(operation, vm, detail) {
 
 async function oracleAction(vm, action) {
   if (!vm || !["START", "STOP"].includes(action)) throw new Error("invalid_oracle_action");
+  // A static Always Free worker is already online. START/STOP means session
+  // connect/disconnect; the free VM itself remains available.
+  if (!vm.id) return;
   if (![OCI_TENANCY, OCI_USER, OCI_FINGERPRINT, OCI_PRIVATE_KEY].every(Boolean)) throw new Error("oracle_not_configured");
   const host = `iaas.${OCI_REGION}.oraclecloud.com`;
   const path = `/20160918/instances/${encodeURIComponent(vm.id)}?action=${action}`;
