@@ -19,12 +19,14 @@ const OCI_FINGERPRINT = process.env.OCI_FINGERPRINT || "";
 const OCI_PRIVATE_KEY = (process.env.OCI_PRIVATE_KEY_PEM || "").replace(/\\n/g, "\n");
 const OCI_REGION = process.env.OCI_REGION || "us-ashburn-1";
 const CONFIGURED_VM_POOL = parseVmPool(process.env.KAGUYA_ORACLE_VM_POOL_JSON || "[]");
-// Always Free can run as one permanently available proxy while OCI API keys are
-// not configured. Explicit pool configuration replaces this fallback.
-const VM_POOL = CONFIGURED_VM_POOL.length ? CONFIGURED_VM_POOL : [{
-  id: "", workerId: "worker-1", name: "Kaguya Always Free", address:
-    process.env.KAGUYA_ORACLE_STATIC_ADDRESS || "193.122.248.232:25568"
-}];
+// Always Free workers may stay online without OCI API credentials. A comma-
+// separated address list provides one isolated lease per user/worker.
+const STATIC_VM_POOL = (process.env.KAGUYA_ORACLE_STATIC_ADDRESSES
+  || process.env.KAGUYA_ORACLE_STATIC_ADDRESS || "193.122.248.232:25568")
+  .split(",").map(value => value.trim()).filter(Boolean).slice(0, 4)
+  .map((address, index) => ({ id: "", workerId: `worker-${index + 1}`,
+    name: `Kaguya Always Free ${index + 1}`, address }));
+const VM_POOL = CONFIGURED_VM_POOL.length ? CONFIGURED_VM_POOL : STATIC_VM_POOL;
 const SESSION_IDLE_MS = 15 * 60 * 1000;
 const PROXY_LEASE_SECONDS = 150;
 const PROXY_OBSERVATION_TTL_SECONDS = 180;
