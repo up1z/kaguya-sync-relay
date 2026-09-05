@@ -11,6 +11,8 @@ const GITHUB_TOKEN = process.env.KAGUYA_GITHUB_TOKEN || "";
 const UPDATE_REPOSITORY = process.env.KAGUYA_UPDATE_REPOSITORY || "up1z/Kaguya-Mod";
 const DEVICE_PEPPER = process.env.KAGUYA_DEVICE_PEPPER || "";
 const ADMIN_TOKEN = process.env.KAGUYA_ADMIN_TOKEN || "";
+const PROXY_TOKEN = process.env.KAGUYA_PROXY_TOKEN || "";
+const PROXY_LEASE_SECONDS = 150;
 const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
@@ -109,6 +111,44 @@ function adminAuthorized(request) {
   const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
   const a = Buffer.from(supplied), b = Buffer.from(ADMIN_TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function proxyAuthorized(request) {
+  if (PROXY_TOKEN.length < 32) return false;
+  const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const a = Buffer.from(supplied), b = Buffer.from(PROXY_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function sourceIpv4(request) {
+  const candidate = String(request.headers["x-forwarded-for"] || request.socket.remoteAddress || "").split(",")[0].trim().replace(/^::ffff:/, "");
+  const parts = candidate.split(".");
+  return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255) ? candidate : "";
+}
+
+async function renewProxyLease(request, body) {
+  const authorization = await authorizeDevice(body, false);
+  if (!authorization.authorized) return authorization;
+  const ip = sourceIpv4(request);
+  if (!ip) throw Object.assign(new Error("public_ipv4_required"), { status: 400 });
+  const expiresAt = Math.floor(Date.now() / 1000) + PROXY_LEASE_SECONDS;
+  await postUpstash(["HSET", "kaguya:proxy:leases", authorization.deviceId,
+    JSON.stringify({ ip, expiresAt })]);
+  await postUpstash(["EXPIRE", "kaguya:proxy:leases", 86400]);
+  return { authorized: true, expiresAt };
+}
+
+async function activeProxyLeases() {
+  const upstream = await postUpstash(["HGETALL", "kaguya:proxy:leases"]);
+  const values = upstream.value.result || [], now = Math.floor(Date.now() / 1000), ips = new Set();
+  for (let i = 0; i < values.length; i += 2) {
+    try {
+      const lease = JSON.parse(values[i + 1]);
+      if (lease.expiresAt > now && sourceIpv4({ headers: { "x-forwarded-for": lease.ip }, socket: {} })) ips.add(lease.ip);
+      else await postUpstash(["HDEL", "kaguya:proxy:leases", values[i]]);
+    } catch { await postUpstash(["HDEL", "kaguya:proxy:leases", values[i]]); }
+  }
+  return [...ips];
 }
 
 async function adminDevices() {
@@ -269,6 +309,17 @@ const server = createServer(async (request, response) => {
       const result = await authorizeDevice(body, true);
       return json(response, result.authorized ? 200 : 202, result);
     } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { authorized: false, error: error.message }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/lease") {
+    try {
+      const result = await renewProxyLease(request, await readBody(request));
+      return json(response, result.authorized ? 200 : 403, result);
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { authorized: false, error: error.message }); }
+  }
+  if (request.method === "GET" && request.url === "/v1/proxy/leases") {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    try { return json(response, 200, { ips: await activeProxyLeases(), ttl: PROXY_LEASE_SECONDS }); }
+    catch (error) { return json(response, 500, { error: error.message || "proxy_lease_failed" }); }
   }
   if (request.url?.startsWith("/v1/admin/")) {
     if (!adminAuthorized(request)) return json(response, 401, { error: "admin_unauthorized" });
