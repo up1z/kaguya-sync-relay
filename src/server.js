@@ -494,7 +494,8 @@ async function load(){const data=await call('/v1/admin/devices');const rows=docu
 
 const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
-    return json(response, validEnvironment() ? 200 : 503, { ok: validEnvironment() });
+    return json(response, validEnvironment() ? 200 : 503, { ok: validEnvironment(), proxySlots: VM_POOL.length,
+      staticProxy: VM_POOL.length === 1 && !VM_POOL[0].id });
   }
   if (request.method === "GET" && request.url === "/admin") {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'", "cache-control": "no-store" });
