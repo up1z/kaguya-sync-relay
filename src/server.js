@@ -18,6 +18,10 @@ const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
 const MAX_CLIENTS_PER_SERVER = 64;
+const WORKER_TARGETS = Object.freeze({ alt3: "alt3.6b6t.org", "2b2t": "connect.2b2t.org", hvhtiers: "hvhtiers.org" });
+const workerCommands = [];
+const workerWaiters = new Set();
+let workerStatus = { online: false, state: "unknown", target: "", updatedAt: 0 };
 
 // One EVAL invocation performs replay protection, rate limiting, state update,
 // stale-client pruning, and retrieval. Upstash bills this as one command.
@@ -119,6 +123,40 @@ function proxyAuthorized(request) {
   const supplied = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
   const a = Buffer.from(supplied), b = Buffer.from(PROXY_TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function takeWorkerCommand() {
+  return workerCommands.shift() || null;
+}
+
+function queueWorkerCommand(command) {
+  if (workerCommands.length >= 16) workerCommands.shift();
+  workerCommands.push(command);
+  for (const wake of workerWaiters) wake();
+  workerWaiters.clear();
+}
+
+async function waitForWorkerCommand(timeoutMs = 25_000) {
+  const immediate = takeWorkerCommand();
+  if (immediate) return immediate;
+  await new Promise(resolve => {
+    const timer = setTimeout(() => { workerWaiters.delete(wake); resolve(); }, timeoutMs);
+    const wake = () => { clearTimeout(timer); resolve(); };
+    workerWaiters.add(wake);
+  });
+  return takeWorkerCommand();
+}
+
+function validWorkerCommand(body) {
+  if (!body || !["connect", "disconnect", "status"].includes(body.action)) return false;
+  return body.action !== "connect" || Object.hasOwn(WORKER_TARGETS, body.target);
+}
+
+function sanitizeWorkerStatus(body) {
+  const state = ["starting", "menu", "connecting", "connected", "disconnected", "error"].includes(body?.state)
+    ? body.state : "unknown";
+  const target = Object.hasOwn(WORKER_TARGETS, body?.target) ? body.target : "";
+  return { online: true, state, target, detail: String(body?.detail || "").slice(0, 160), updatedAt: Date.now() };
 }
 
 function sourceIpv4(request) {
@@ -365,6 +403,38 @@ const server = createServer(async (request, response) => {
       if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
       return json(response, 200, await proxyObservation());
     } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/worker/command") {
+    try {
+      const body = await readBody(request);
+      const authorization = await authorizeDevice(body, false);
+      if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
+      if (!validWorkerCommand(body)) return json(response, 400, { error: "invalid_worker_command" });
+      const command = { id: `${Date.now()}-${authorization.deviceId.slice(0, 12)}`, action: body.action,
+        target: body.action === "connect" ? body.target : "", requestedAt: Date.now() };
+      queueWorkerCommand(command);
+      return json(response, 202, { queued: true, id: command.id });
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/worker/status") {
+    try {
+      const authorization = await authorizeDevice(await readBody(request), false);
+      if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
+      const fresh = Date.now() - workerStatus.updatedAt <= 90_000;
+      return json(response, 200, fresh ? workerStatus : { online: false, state: "offline", target: "", updatedAt: workerStatus.updatedAt });
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
+  }
+  if (request.method === "GET" && request.url === "/v1/proxy/worker/poll") {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    try { return json(response, 200, { command: await waitForWorkerCommand() }); }
+    catch (error) { return json(response, 500, { error: error.message || "worker_poll_failed" }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/worker/report") {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    try {
+      workerStatus = sanitizeWorkerStatus(await readBody(request));
+      return json(response, 200, { ok: true });
+    } catch (error) { return json(response, 400, { error: error.message || "worker_report_failed" }); }
   }
   if (request.url?.startsWith("/v1/admin/")) {
     if (!adminAuthorized(request)) return json(response, 401, { error: "admin_unauthorized" });
