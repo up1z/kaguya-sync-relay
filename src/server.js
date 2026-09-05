@@ -119,7 +119,10 @@ async function allocateSession(deviceId, target) {
   const all = await postUpstash(["HGETALL", "kaguya:proxy:sessions"]); const used = new Set();
   for (let index = 0; index < (all.value.result || []).length; index += 2) try {
     const existing = JSON.parse(all.value.result[index + 1]);
-    if (Date.now() - Number(existing.lastSeen || 0) <= SESSION_IDLE_MS) used.add(existing.slotId || existing.workerId);
+    if (Date.now() - Number(existing.lastSeen || 0) <= SESSION_IDLE_MS) {
+      const legacySlot = VM_POOL.find(candidate => candidate.shared && candidate.workerId === existing.workerId)?.slotId;
+      used.add(existing.slotId || legacySlot || existing.workerId);
+    }
     else await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]);
   } catch { await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]); }
   const vm = VM_POOL.find(candidate => !used.has(candidate.slotId || candidate.workerId));
@@ -512,7 +515,7 @@ async function load(){const data=await call('/v1/admin/devices');const rows=docu
 const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     return json(response, validEnvironment() ? 200 : 503, { ok: validEnvironment(), proxySlots: VM_POOL.length,
-      staticProxy: VM_POOL.length === 1 && !VM_POOL[0].id });
+      staticProxy: VM_POOL.length > 0 && VM_POOL.every(vm => !vm.id) });
   }
   if (request.method === "GET" && request.url === "/admin") {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'", "cache-control": "no-store" });
