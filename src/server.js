@@ -21,11 +21,14 @@ const OCI_REGION = process.env.OCI_REGION || "us-ashburn-1";
 const CONFIGURED_VM_POOL = parseVmPool(process.env.KAGUYA_ORACLE_VM_POOL_JSON || "[]");
 // Always Free workers may stay online without OCI API credentials. A comma-
 // separated address list provides one isolated lease per user/worker.
+const STATIC_PROXY_CAPACITY = Math.max(1, Math.min(8, Number(process.env.KAGUYA_STATIC_PROXY_CAPACITY || 2)));
 const STATIC_VM_POOL = (process.env.KAGUYA_ORACLE_STATIC_ADDRESSES
   || process.env.KAGUYA_ORACLE_STATIC_ADDRESS || "193.122.248.232:25568")
   .split(",").map(value => value.trim()).filter(Boolean).slice(0, 4)
-  .map((address, index) => ({ id: "", workerId: `worker-${index + 1}`,
-    name: `Kaguya Always Free ${index + 1}`, address }));
+  .flatMap((address, workerIndex) => Array.from({ length: STATIC_PROXY_CAPACITY }, (_, slotIndex) => ({
+    id: "", workerId: `worker-${workerIndex + 1}`, slotId: `static-${workerIndex + 1}-${slotIndex + 1}`,
+    shared: true, name: `Kaguya Shared ${workerIndex + 1}/${slotIndex + 1}`, address
+  }))).slice(0, 8);
 const VM_POOL = CONFIGURED_VM_POOL.length ? CONFIGURED_VM_POOL : STATIC_VM_POOL;
 const SESSION_IDLE_MS = 15 * 60 * 1000;
 const PROXY_LEASE_SECONDS = 150;
@@ -116,23 +119,31 @@ async function allocateSession(deviceId, target) {
   const all = await postUpstash(["HGETALL", "kaguya:proxy:sessions"]); const used = new Set();
   for (let index = 0; index < (all.value.result || []).length; index += 2) try {
     const existing = JSON.parse(all.value.result[index + 1]);
-    if (Date.now() - Number(existing.lastSeen || 0) <= SESSION_IDLE_MS) used.add(existing.workerId);
+    if (Date.now() - Number(existing.lastSeen || 0) <= SESSION_IDLE_MS) used.add(existing.slotId || existing.workerId);
     else await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]);
   } catch { await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]); }
-  const vm = VM_POOL.find(candidate => !used.has(candidate.workerId));
+  const vm = VM_POOL.find(candidate => !used.has(candidate.slotId || candidate.workerId));
   if (!vm) throw Object.assign(new Error("oracle_pool_full"), { status: 503 });
-  session = { workerId: vm.workerId, address: vm.address, target, state: "starting", createdAt: Date.now(), lastSeen: Date.now() };
+  session = { workerId: vm.workerId, slotId: vm.slotId || vm.workerId,
+    address: addressForTarget(vm.address, target), target, state: vm.shared ? "connected" : "starting",
+    createdAt: Date.now(), lastSeen: Date.now() };
   await writeSession(deviceId, session);
   try { await oracleAction(vm, "START"); } catch (error) { await postUpstash(["HDEL", "kaguya:proxy:sessions", deviceId]); await discordFailure("start", vm, error.message); throw error; }
-  await queueWorker(vm.workerId, { id: `${Date.now()}-${deviceId.slice(0, 12)}`, action: "connect", target, requestedAt: Date.now() });
+  if (!vm.shared) await queueWorker(vm.workerId, { id: `${Date.now()}-${deviceId.slice(0, 12)}`, action: "connect", target, requestedAt: Date.now() });
   return session;
 }
 async function releaseSession(deviceId, reason = "client_disconnect") {
   const session = await readSession(deviceId); if (!session) return false;
-  const vm = VM_POOL.find(candidate => candidate.workerId === session.workerId);
-  await queueWorker(session.workerId, { id: `${Date.now()}-${deviceId.slice(0, 12)}`, action: "disconnect", target: "", requestedAt: Date.now() });
+  const vm = VM_POOL.find(candidate => (candidate.slotId || candidate.workerId) === (session.slotId || session.workerId));
+  if (!vm?.shared) await queueWorker(session.workerId, { id: `${Date.now()}-${deviceId.slice(0, 12)}`, action: "disconnect", target: "", requestedAt: Date.now() });
   try { await oracleAction(vm, "STOP"); } catch (error) { await discordFailure("stop", vm, `${reason}: ${error.message}`); throw error; }
   await postUpstash(["HDEL", "kaguya:proxy:sessions", deviceId]); return true;
+}
+
+function addressForTarget(address, target) {
+  const host = String(address || "").replace(/:\d+$/, "");
+  const port = target === "2b2t" ? 25569 : target === "hvhtiers" ? 25570 : 25568;
+  return `${host}:${port}`;
 }
 
 // One EVAL invocation performs replay protection, rate limiting, state update,
