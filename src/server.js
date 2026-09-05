@@ -112,7 +112,11 @@ async function allocateSession(deviceId, target) {
   let session = await readSession(deviceId);
   if (session) { session.lastSeen = Date.now(); session.target = target || session.target; await writeSession(deviceId, session); return session; }
   const all = await postUpstash(["HGETALL", "kaguya:proxy:sessions"]); const used = new Set();
-  for (let index = 1; index < (all.value.result || []).length; index += 2) try { used.add(JSON.parse(all.value.result[index]).workerId); } catch { }
+  for (let index = 0; index < (all.value.result || []).length; index += 2) try {
+    const existing = JSON.parse(all.value.result[index + 1]);
+    if (Date.now() - Number(existing.lastSeen || 0) <= SESSION_IDLE_MS) used.add(existing.workerId);
+    else await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]);
+  } catch { await postUpstash(["HDEL", "kaguya:proxy:sessions", all.value.result[index]]); }
   const vm = VM_POOL.find(candidate => !used.has(candidate.workerId));
   if (!vm) throw Object.assign(new Error("oracle_pool_full"), { status: 503 });
   session = { workerId: vm.workerId, address: vm.address, target, state: "starting", createdAt: Date.now(), lastSeen: Date.now() };
