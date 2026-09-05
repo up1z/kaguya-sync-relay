@@ -13,6 +13,7 @@ const DEVICE_PEPPER = process.env.KAGUYA_DEVICE_PEPPER || "";
 const ADMIN_TOKEN = process.env.KAGUYA_ADMIN_TOKEN || "";
 const PROXY_TOKEN = process.env.KAGUYA_PROXY_TOKEN || "";
 const PROXY_LEASE_SECONDS = 150;
+const PROXY_OBSERVATION_TTL_SECONDS = 180;
 const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
@@ -149,6 +150,38 @@ async function activeProxyLeases() {
     } catch { await postUpstash(["HDEL", "kaguya:proxy:leases", values[i]]); }
   }
   return [...ips];
+}
+
+function validProxyObservation(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.targets)) return false;
+  if (!Number.isSafeInteger(body.measuredAt) || Math.abs(Date.now() - body.measuredAt) > 120_000) return false;
+  return body.targets.length === 3 && body.targets.every(target =>
+    ["alt3", "2b2t", "hvhtiers"].includes(target.id)
+    && Number.isFinite(target.rttMs) && target.rttMs >= 0 && target.rttMs <= 30_000
+    && Number.isFinite(target.failureRate) && target.failureRate >= 0 && target.failureRate <= 1);
+}
+
+async function storeProxyObservation(body) {
+  if (!validProxyObservation(body)) throw Object.assign(new Error("invalid_proxy_observation"), { status: 400 });
+  const sanitized = {
+    measuredAt: body.measuredAt,
+    targets: body.targets.map(target => ({
+      id: target.id, rttMs: Math.round(target.rttMs),
+      jitterMs: Math.max(0, Math.round(Number(target.jitterMs) || 0)),
+      failureRate: Math.round(target.failureRate * 1000) / 1000,
+      samples: Math.max(1, Math.min(60, Math.round(Number(target.samples) || 1)))
+    }))
+  };
+  await postUpstash(["SET", "kaguya:proxy:observation", JSON.stringify(sanitized), "EX", PROXY_OBSERVATION_TTL_SECONDS]);
+  return sanitized;
+}
+
+async function proxyObservation() {
+  const upstream = await postUpstash(["GET", "kaguya:proxy:observation"]);
+  if (typeof upstream.value.result !== "string") return { available: false, targets: [] };
+  const stored = JSON.parse(upstream.value.result);
+  return { available: Date.now() - stored.measuredAt <= PROXY_OBSERVATION_TTL_SECONDS * 1000,
+    measuredAt: stored.measuredAt, targets: stored.targets || [] };
 }
 
 async function adminDevices() {
@@ -320,6 +353,18 @@ const server = createServer(async (request, response) => {
     if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
     try { return json(response, 200, { ips: await activeProxyLeases(), ttl: PROXY_LEASE_SECONDS }); }
     catch (error) { return json(response, 500, { error: error.message || "proxy_lease_failed" }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/observation/report") {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    try { return json(response, 200, { ok: true, observation: await storeProxyObservation(await readBody(request)) }); }
+    catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/observation") {
+    try {
+      const authorization = await authorizeDevice(await readBody(request), false);
+      if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
+      return json(response, 200, await proxyObservation());
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
   }
   if (request.url?.startsWith("/v1/admin/")) {
     if (!adminAuthorized(request)) return json(response, 401, { error: "admin_unauthorized" });
