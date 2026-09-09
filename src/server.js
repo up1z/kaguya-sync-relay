@@ -33,6 +33,7 @@ const VM_POOL = CONFIGURED_VM_POOL.length ? CONFIGURED_VM_POOL : STATIC_VM_POOL;
 const SESSION_IDLE_MS = 15 * 60 * 1000;
 const PROXY_LEASE_SECONDS = 150;
 const PROXY_OBSERVATION_TTL_SECONDS = 180;
+const REMOTE_COMBAT_TTL_SECONDS = 3;
 const MAX_BODY = 16 * 1024;
 const CLOCK_SKEW_MS = 120_000;
 const STALE_SECONDS = 7 * 24 * 60 * 60;
@@ -113,9 +114,10 @@ async function readSession(deviceId) {
 async function writeSession(deviceId, session) {
   await postUpstash(["HSET", "kaguya:proxy:sessions", deviceId, JSON.stringify(session)]);
 }
-async function allocateSession(deviceId, target) {
+async function allocateSession(deviceId, target, viaProxy = false) {
   let session = await readSession(deviceId);
-  if (session) { session.lastSeen = Date.now(); session.target = target || session.target; await writeSession(deviceId, session); return session; }
+  if (session) { session.lastSeen = Date.now(); session.target = target || session.target; session.viaProxy = viaProxy;
+    session.address = addressForTarget(session.address, session.target, viaProxy); await writeSession(deviceId, session); return session; }
   const all = await postUpstash(["HGETALL", "kaguya:proxy:sessions"]); const used = new Set();
   for (let index = 0; index < (all.value.result || []).length; index += 2) try {
     const existing = JSON.parse(all.value.result[index + 1]);
@@ -128,7 +130,7 @@ async function allocateSession(deviceId, target) {
   const vm = VM_POOL.find(candidate => !used.has(candidate.slotId || candidate.workerId));
   if (!vm) throw Object.assign(new Error("oracle_pool_full"), { status: 503 });
   session = { workerId: vm.workerId, slotId: vm.slotId || vm.workerId,
-    address: addressForTarget(vm.address, target), target, state: vm.shared ? "connected" : "starting",
+    address: addressForTarget(vm.address, target, viaProxy), target, viaProxy, state: vm.shared ? "connected" : "starting",
     createdAt: Date.now(), lastSeen: Date.now() };
   await writeSession(deviceId, session);
   try { await oracleAction(vm, "START"); } catch (error) { await postUpstash(["HDEL", "kaguya:proxy:sessions", deviceId]); await discordFailure("start", vm, error.message); throw error; }
@@ -143,9 +145,10 @@ async function releaseSession(deviceId, reason = "client_disconnect") {
   await postUpstash(["HDEL", "kaguya:proxy:sessions", deviceId]); return true;
 }
 
-function addressForTarget(address, target) {
+function addressForTarget(address, target, viaProxy = false) {
   const host = String(address || "").replace(/:\d+$/, "");
-  const port = target === "2b2t" ? 25569 : target === "hvhtiers" ? 25570 : 25568;
+  const port = viaProxy ? (target === "2b2t" ? 25669 : target === "hvhtiers" ? 25670 : 25668)
+    : (target === "2b2t" ? 25569 : target === "hvhtiers" ? 25570 : 25568);
   return `${host}:${port}`;
 }
 
@@ -293,6 +296,27 @@ function sanitizeWorkerStatus(body) {
   const verificationUri = String(body?.verificationUri || "").startsWith("https://") ? String(body.verificationUri).slice(0, 200) : "";
   return { online: true, state, target, detail: String(body?.detail || "").slice(0, 160),
     userCode, verificationUri, updatedAt: Date.now() };
+}
+
+function sanitizeCombatState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const sequence = Number(value.sequence || 0);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) return null;
+  const route = Object.hasOwn(WORKER_TARGETS, value.route) ? value.route : "";
+  const playerUuid = String(value.playerUuid || "");
+  if (!/^[0-9a-f-]{36}$/i.test(playerUuid)) return null;
+  const number = key => Number.isFinite(Number(value[key])) ? Number(value[key]) : 0;
+  return { sequence, route, playerUuid, mioActive: value.mioActive === true,
+    x: number("x"), y: number("y"), z: number("z"),
+    mio: value.mio && typeof value.mio === "object" ? value.mio : {},
+    kaguya: value.kaguya && typeof value.kaguya === "object" ? value.kaguya : {},
+    receivedAt: Date.now() };
+}
+
+function sanitizeCombatReport(value) {
+  const sequence = Number(value?.ackSequence || 0);
+  return { executorReady: value?.executorReady === true, ackSequence: Number.isSafeInteger(sequence) ? sequence : 0,
+    detail: String(value?.detail || "").slice(0, 120), updatedAt: Date.now() };
 }
 
 function sourceIpv4(request) {
@@ -561,7 +585,7 @@ const server = createServer(async (request, response) => {
       const body = await readBody(request); const authorization = await authorizeDevice(body, false);
       if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
       if (!Object.hasOwn(WORKER_TARGETS, body.target)) return json(response, 400, { error: "invalid_target" });
-      const session = await allocateSession(authorization.deviceId, body.target);
+      const session = await allocateSession(authorization.deviceId, body.target, body.viaProxy === true);
       return json(response, 202, { assigned: true, ...session });
     } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 502, { error: error.message }); }
   }
@@ -623,6 +647,52 @@ const server = createServer(async (request, response) => {
       workerStatuses.set(workerId, sanitizeWorkerStatus(body));
       return json(response, 200, { ok: true });
     } catch (error) { return json(response, 400, { error: error.message || "worker_report_failed" }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/combat/state") {
+    try {
+      const body = await readBody(request); const authorization = await authorizeDevice(body, false);
+      if (!authorization.authorized) return json(response, 403, { error: "device_not_authorized" });
+      const session = await readSession(authorization.deviceId);
+      if (!session) return json(response, 409, { error: "session_not_started" });
+      const state = sanitizeCombatState(body.state);
+      if (!state || state.route !== session.target) return json(response, 400, { error: "invalid_combat_state" });
+      await postUpstash(["SET", `kaguya:proxy:combat:state:${authorization.deviceId}`, JSON.stringify({ ...state, workerId: session.workerId }), "EX", REMOTE_COMBAT_TTL_SECONDS]);
+      const report = await postUpstash(["GET", `kaguya:proxy:combat:report:${authorization.deviceId}`]);
+      let status = { executorReady: false, ackSequence: 0 };
+      if (typeof report.value.result === "string") try { status = JSON.parse(report.value.result); } catch { }
+      const fresh = Date.now() - Number(status.updatedAt || 0) <= REMOTE_COMBAT_TTL_SECONDS * 1000;
+      return json(response, 200, { executorReady: fresh && status.executorReady === true,
+        sequence: state.sequence, ackSequence: fresh ? Number(status.ackSequence || 0) : 0 });
+    } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
+  }
+  if (request.method === "GET" && request.url?.startsWith("/v1/proxy/combat/poll")) {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    const workerId = String(request.headers["x-kaguya-worker"] || "");
+    if (!VM_POOL.some(vm => vm.workerId === workerId)) return json(response, 400, { error: "unknown_worker" });
+    try {
+      const sessions = await postUpstash(["HGETALL", "kaguya:proxy:sessions"]), states = [];
+      const values = sessions.value.result || [];
+      for (let i = 0; i < values.length; i += 2) try {
+        const session = JSON.parse(values[i + 1]);
+        if (session.workerId !== workerId || Date.now() - Number(session.lastSeen || 0) > SESSION_IDLE_MS) continue;
+        const stored = await postUpstash(["GET", `kaguya:proxy:combat:state:${values[i]}`]);
+        if (typeof stored.value.result === "string") states.push({ deviceId: values[i], ...JSON.parse(stored.value.result) });
+      } catch { }
+      return json(response, 200, { states });
+    } catch (error) { return json(response, 500, { error: error.message || "combat_poll_failed" }); }
+  }
+  if (request.method === "POST" && request.url === "/v1/proxy/combat/report") {
+    if (!proxyAuthorized(request)) return json(response, 401, { error: "proxy_unauthorized" });
+    try {
+      const body = await readBody(request); const deviceId = String(body.deviceId || "");
+      if (!/^[0-9a-f]{64}$/.test(deviceId)) return json(response, 400, { error: "invalid_device" });
+      const session = await readSession(deviceId);
+      const workerId = String(request.headers["x-kaguya-worker"] || "");
+      if (!session || session.workerId !== workerId) return json(response, 403, { error: "session_worker_mismatch" });
+      const report = sanitizeCombatReport(body);
+      await postUpstash(["SET", `kaguya:proxy:combat:report:${deviceId}`, JSON.stringify(report), "EX", REMOTE_COMBAT_TTL_SECONDS]);
+      return json(response, 200, { ok: true });
+    } catch (error) { return json(response, 400, { error: error.message || "combat_report_failed" }); }
   }
   if (request.url?.startsWith("/v1/admin/")) {
     if (!adminAuthorized(request)) return json(response, 401, { error: "admin_unauthorized" });
