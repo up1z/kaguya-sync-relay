@@ -310,13 +310,16 @@ function sanitizeCombatState(value) {
     x: number("x"), y: number("y"), z: number("z"),
     mio: value.mio && typeof value.mio === "object" ? value.mio : {},
     kaguya: value.kaguya && typeof value.kaguya === "object" ? value.kaguya : {},
+    modules: Array.isArray(value.modules) ? value.modules.slice(0, 256) : [],
     receivedAt: Date.now() };
 }
 
 function sanitizeCombatReport(value) {
   const sequence = Number(value?.ackSequence || 0);
+  const ownedModules = Array.isArray(value?.ownedModules) ? value.ownedModules
+    .filter(name => typeof name === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(name)).slice(0, 64) : [];
   return { executorReady: value?.executorReady === true, ackSequence: Number.isSafeInteger(sequence) ? sequence : 0,
-    detail: String(value?.detail || "").slice(0, 120), updatedAt: Date.now() };
+    ownedModules, detail: String(value?.detail || "").slice(0, 120), updatedAt: Date.now() };
 }
 
 function sourceIpv4(request) {
@@ -662,7 +665,8 @@ const server = createServer(async (request, response) => {
       if (typeof report.value.result === "string") try { status = JSON.parse(report.value.result); } catch { }
       const fresh = Date.now() - Number(status.updatedAt || 0) <= REMOTE_COMBAT_TTL_SECONDS * 1000;
       return json(response, 200, { executorReady: fresh && status.executorReady === true,
-        sequence: state.sequence, ackSequence: fresh ? Number(status.ackSequence || 0) : 0 });
+        sequence: state.sequence, ackSequence: fresh ? Number(status.ackSequence || 0) : 0,
+        ownedModules: fresh && Array.isArray(status.ownedModules) ? status.ownedModules : [] });
     } catch (error) { return json(response, Number.isInteger(error.status) ? error.status : 400, { error: error.message }); }
   }
   if (request.method === "GET" && request.url?.startsWith("/v1/proxy/combat/poll")) {
