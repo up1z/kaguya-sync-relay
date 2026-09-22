@@ -571,16 +571,18 @@ const server = createServer(async (request, response) => {
       const body = await readBody(request);
       const source = String(request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown").split(",")[0].trim();
       const sourceId = createHmac("sha256", DEVICE_PEPPER).update(source).digest("hex").slice(0, 24);
-      const sourceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:ip:${sourceId}`], "auth_ip_rate");
+      // Version the keys so legacy rate-limit values of a different Redis type
+      // cannot block every authorization request with WRONGTYPE.
+      const sourceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:v2:ip:${sourceId}`], "auth_ip_rate");
       if (Number(sourceRate.value.result || 0) === 1)
-        await checkedUpstash(["EXPIRE", `kaguya:auth:rate:ip:${sourceId}`, 3600], "auth_ip_rate_expire");
+        await checkedUpstash(["EXPIRE", `kaguya:auth:rate:v2:ip:${sourceId}`, 3600], "auth_ip_rate_expire");
       if (Number(sourceRate.value.result || 0) > 120)
         return json(response, 429, { authorized: false, error: "ip_rate_limited" });
       const identity = deviceIdentity(body);
       if (identity) {
-        const deviceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:device:${identity.deviceId}`], "auth_device_rate");
+        const deviceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:v2:device:${identity.deviceId}`], "auth_device_rate");
         if (Number(deviceRate.value.result || 0) === 1)
-          await checkedUpstash(["EXPIRE", `kaguya:auth:rate:device:${identity.deviceId}`, 3600], "auth_device_rate_expire");
+          await checkedUpstash(["EXPIRE", `kaguya:auth:rate:v2:device:${identity.deviceId}`, 3600], "auth_device_rate_expire");
         if (Number(deviceRate.value.result || 0) > 20)
           return json(response, 429, { authorized: false, error: "device_rate_limited" });
       }
