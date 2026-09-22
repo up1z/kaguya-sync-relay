@@ -540,12 +540,22 @@ function postUpstash(command) {
   });
 }
 
+let upstashUnavailableUntil = 0;
+let upstashLastFailureLog = 0;
+
 async function checkedUpstash(command, operation = "redis") {
+  if (Date.now() < upstashUnavailableUntil)
+    throw Object.assign(new Error("database_temporarily_unavailable"), { status: 503 });
   const result = await postUpstash(command);
   if (result.status < 200 || result.status >= 300 || !result.value || result.value.error) {
     const detail = String(result.value?.error || `http_${result.status}`).slice(0, 160);
-    console.error(`Upstash ${operation} failed: ${detail}`);
-    throw Object.assign(new Error(`database_${operation}_failed`), { status: 502 });
+    const quotaExceeded = /max requests limit exceeded/i.test(detail);
+    if (quotaExceeded) upstashUnavailableUntil = Date.now() + 5 * 60_000;
+    if (Date.now() - upstashLastFailureLog >= 5 * 60_000) {
+      console.error(`Upstash ${operation} failed: ${detail}`);
+      upstashLastFailureLog = Date.now();
+    }
+    throw Object.assign(new Error(quotaExceeded ? "database_quota_exceeded" : `database_${operation}_failed`), { status: quotaExceeded ? 503 : 502 });
   }
   return result;
 }
@@ -559,7 +569,6 @@ async function incrementAuthRate(key, operation) {
   } catch (error) {
     // Availability of device enrollment must not depend on the optional abuse
     // counter. Authorization and pending-record writes remain fail-closed.
-    console.warn(`Upstash ${operation} unavailable; continuing without this counter`);
     return 0;
   }
 }
