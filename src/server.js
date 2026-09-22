@@ -550,6 +550,20 @@ async function checkedUpstash(command, operation = "redis") {
   return result;
 }
 
+async function incrementAuthRate(key, operation) {
+  try {
+    const result = await checkedUpstash(["INCR", key], operation);
+    const count = Number(result.value.result || 0);
+    if (count === 1) await checkedUpstash(["EXPIRE", key, 3600], `${operation}_expire`);
+    return count;
+  } catch (error) {
+    // Availability of device enrollment must not depend on the optional abuse
+    // counter. Authorization and pending-record writes remain fail-closed.
+    console.warn(`Upstash ${operation} unavailable; continuing without this counter`);
+    return 0;
+  }
+}
+
 const ADMIN_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Kaguya Device Admin</title><style>body{font:14px system-ui;background:#101018;color:#eee;max-width:980px;margin:40px auto;padding:0 16px}button,input{background:#24243a;color:#fff;border:1px solid #666;padding:8px}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{padding:9px;border-bottom:1px solid #333;text-align:left}.pending{color:#ffd166}.active{color:#71e29b}</style>
 <h1>Kaguya Device Admin</h1><p>Only anonymous device IDs and license hashes are shown.</p><button id="reload">Reload</button> <button id="token">Change token</button><span id="status"></span><table><thead><tr><th>Status</th><th>Label</th><th>Anonymous device</th><th>Requested / approved</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table>
@@ -573,17 +587,13 @@ const server = createServer(async (request, response) => {
       const sourceId = createHmac("sha256", DEVICE_PEPPER).update(source).digest("hex").slice(0, 24);
       // Version the keys so legacy rate-limit values of a different Redis type
       // cannot block every authorization request with WRONGTYPE.
-      const sourceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:v2:ip:${sourceId}`], "auth_ip_rate");
-      if (Number(sourceRate.value.result || 0) === 1)
-        await checkedUpstash(["EXPIRE", `kaguya:auth:rate:v2:ip:${sourceId}`, 3600], "auth_ip_rate_expire");
-      if (Number(sourceRate.value.result || 0) > 120)
+      const sourceRate = await incrementAuthRate(`kaguya:auth:rate:v2:ip:${sourceId}`, "auth_ip_rate");
+      if (sourceRate > 120)
         return json(response, 429, { authorized: false, error: "ip_rate_limited" });
       const identity = deviceIdentity(body);
       if (identity) {
-        const deviceRate = await checkedUpstash(["INCR", `kaguya:auth:rate:v2:device:${identity.deviceId}`], "auth_device_rate");
-        if (Number(deviceRate.value.result || 0) === 1)
-          await checkedUpstash(["EXPIRE", `kaguya:auth:rate:v2:device:${identity.deviceId}`, 3600], "auth_device_rate_expire");
-        if (Number(deviceRate.value.result || 0) > 20)
+        const deviceRate = await incrementAuthRate(`kaguya:auth:rate:v2:device:${identity.deviceId}`, "auth_device_rate");
+        if (deviceRate > 20)
           return json(response, 429, { authorized: false, error: "device_rate_limited" });
       }
       const result = await authorizeDevice(body, true);
