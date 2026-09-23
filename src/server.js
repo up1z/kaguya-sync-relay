@@ -1,10 +1,13 @@
 import { createHash, createHmac, createSign, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { createClient } from "redis";
 
 const PORT = Number(process.env.PORT || 10000);
 const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const VALKEY_URL = process.env.AIVEN_VALKEY_URL || process.env.VALKEY_URL || "";
+let valkeyClient;
 const SYNC_KEY = process.env.SYNC_HMAC_KEY || "";
 const LICENSES = parseLicenses(process.env.KAGUYA_LICENSES_JSON || "{}");
 const GITHUB_TOKEN = process.env.KAGUYA_GITHUB_TOKEN || "";
@@ -207,7 +210,7 @@ function json(response, status, value) {
 }
 
 function validEnvironment() {
-  return UPSTASH_URL.startsWith("https://") && UPSTASH_TOKEN.length >= 16 && SYNC_KEY.length >= 16;
+  return (UPSTASH_URL.startsWith("https://") && UPSTASH_TOKEN.length >= 16 || VALKEY_URL.startsWith("rediss://")) && SYNC_KEY.length >= 16;
 }
 
 function parseLicenses(value) {
@@ -507,7 +510,20 @@ async function synchronize(body) {
   return Array.isArray(value.result) ? value.result : [];
 }
 
-function postUpstash(command) {
+async function postUpstash(command) {
+  if (VALKEY_URL.startsWith("rediss://")) {
+    if (!valkeyClient) {
+      valkeyClient = createClient({ url: VALKEY_URL, socket: { connectTimeout: 15_000 } });
+      valkeyClient.on("error", error => console.error(`Valkey request failed: ${error.message}`));
+      await valkeyClient.connect();
+    }
+    try {
+      const result = await valkeyClient.sendCommand(command.map(value => String(value)));
+      return { status: 200, value: { result } };
+    } catch (error) {
+      return { status: 502, value: { error: String(error.message || error) } };
+    }
+  }
   return new Promise((resolve, reject) => {
     const encoded = Buffer.from(JSON.stringify(command));
     const request = httpsRequest(new URL(UPSTASH_URL), {

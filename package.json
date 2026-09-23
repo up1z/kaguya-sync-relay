@@ -10,5 +10,8 @@
     "start": "node src/server.js",
     "test": "node --test",
     "admin": "node scripts/device-admin.mjs"
+  },
+  "dependencies": {
+    "redis": "^5.0.1"
   }
 }
