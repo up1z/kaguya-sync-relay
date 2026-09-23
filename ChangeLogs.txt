@@ -1,0 +1,15 @@
+Kaguya Sync Relay - 2026-09-23
+
+English
+- Added Aiven Valkey support through a TLS `rediss://` connection.
+- Render can now use `AIVEN_VALKEY_URL` as the authorization and sync backend.
+- Added Redis client pooling and graceful connection error handling for Valkey.
+- Verified pending device enrollment writes and read-backs against the new backend.
+- Suppressed repeated database-quota log storms with a five-minute outage circuit.
+
+日本語
+- TLS対応の `rediss://` 接続によるAiven Valkey対応を追加しました。
+- Renderの `AIVEN_VALKEY_URL` で認証・同期DBをValkeyへ切り替えられるようにしました。
+- Valkey用Redisクライアントの接続プールと接続エラー処理を追加しました。
+- 新しいDBで端末申請の保存・読戻し検証が通ることを確認しました。
+- DB上限到達時の同一エラー連続出力を5分間抑制する回路を追加しました。
